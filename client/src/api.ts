@@ -1,4 +1,10 @@
-import type { AnalysisResult, ImpactResult, MatchResult, RuleInput } from './types';
+import type {
+  AnalysisResult,
+  ImpactResult,
+  MatchResult,
+  ReproPackage,
+  RuleInput,
+} from './types';
 
 async function post<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -27,4 +33,11 @@ export function computeImpact(
   samples: string[],
 ): Promise<ImpactResult> {
   return post<ImpactResult>('/api/impact', { baseline, candidate, samples });
+}
+
+export function computeRepro(
+  rules: RuleInput[],
+  selectedRuleIds: string[],
+): Promise<ReproPackage> {
+  return post<ReproPackage>('/api/repro', { rules, selectedRuleIds });
 }

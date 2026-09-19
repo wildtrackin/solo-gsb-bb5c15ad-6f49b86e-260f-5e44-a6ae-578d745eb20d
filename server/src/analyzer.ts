@@ -90,6 +90,51 @@ export interface ImpactResult {
   summary: Record<ImpactCategory, CategorySummary> & { total: CategorySummary };
 }
 
+// ---------- 最小复现包 ----------
+
+/** 复现包中的一个冲突对（同时给出该对最短见证路径）。 */
+export interface ReproConflict {
+  index: number; // 在本复现包冲突对序列中的下标（0 起）
+  a: string;
+  b: string;
+  witness: string; // 该冲突对的最短共同命中路径（候选路径来源）
+}
+
+/** 复现包中的一条具体路径及其实际命中情况。 */
+export interface ReproPath {
+  path: string;
+  segments: number; // 路径总段数（并列时的决胜指标之一）
+  matchedRules: string[]; // 该路径实际命中的已选规则 id，按胜出顺序排列
+  coveredConflicts: number[]; // 实际覆盖的冲突对下标
+}
+
+export interface ReproPackage {
+  selectedRuleIds: string[];
+  conflicts: ReproConflict[];
+  candidates: ReproPath[]; // 去重后的全部候选路径
+  paths: ReproPath[]; // 入选的最少路径集合（字典序排列）
+  conflictPairCount: number;
+  candidateCount: number;
+  pathCount: number;
+  totalSegments: number; // 入选路径总段数
+}
+
+/** 最小集合覆盖求解器的候选项：覆盖位掩码 + 决胜信息。 */
+export interface CoverItem {
+  cover: bigint; // 覆盖的冲突对位掩码（第 i 位对应第 i 个冲突对）
+  segments: number; // 路径段数
+  pathSegments: string[]; // 路径段序列（字典序决胜用）
+}
+
+export interface MinimumCoverResult {
+  indices: number[] | null; // 入选候选项下标；exact=false 时为已找到的最优上界
+  exact: boolean; // 是否在搜索预算内完成了完整分支限界
+  nodes: number; // 实际展开的搜索节点数
+}
+
+/** 分支限界的最大节点展开预算：路由派生的候选覆盖都是边团，正常输入远低于此。 */
+const MAX_SEARCH_NODES = 300_000;
+
 const PARAM_PLACEHOLDER = 'x'; // 见证路径中为参数段生成的具体值
 const MAX_SAMPLE_COUNT = 1_000_000_000; // 单条样本允许的最大请求次数
 
@@ -401,5 +446,347 @@ export function impact(
     samples,
     invalidSamples,
     summary,
+  };
+}
+
+// ---------- 最小复现包：确定性分支限界最小集合覆盖 ----------
+
+function popcountBig(x: bigint): number {
+  let n = 0;
+  while (x > 0n) {
+    x &= x - 1n;
+    n++;
+  }
+  return n;
+}
+
+/** 按段序列比较路径字典序：先出现差异的段按字符串比较，短序列前缀更小。 */
+function compareSegments(x: string[], y: string[]): number {
+  const k = Math.min(x.length, y.length);
+  for (let i = 0; i < k; i++) {
+    if (x[i] < y[i]) return -1;
+    if (x[i] > y[i]) return 1;
+  }
+  return x.length - y.length;
+}
+
+/** 比较两个同大小方案：总段数少者优；再按排序后的路径字典序逐项决胜。 */
+function compareSolutions(
+  xs: string[][],
+  ys: string[][],
+  segX: number,
+  segY: number,
+): number {
+  if (segX !== segY) return segX - segY;
+  const sx = xs.map((p) => p.slice()).sort(compareSegments);
+  const sy = ys.map((p) => p.slice()).sort(compareSegments);
+  for (let i = 0; i < sx.length; i++) {
+    const c = compareSegments(sx[i], sy[i]);
+    if (c !== 0) return c;
+  }
+  return 0;
+}
+
+/**
+ * 确定性分支限界求解最小集合覆盖。
+ *  - 精确最优：候选至多覆盖 190 个冲突对（20 条规则两两求交），位掩码为 bigint。
+ *  - 分支：取当前未覆盖冲突对中「可覆盖它的候选数最少」的一对，只在能覆盖它的候选上分支。
+ *  - 下界：取 |剩余| / maxGain 的上取整，并与独立集打包下界取较大值。
+ *  - 并列决胜：路径总段数、排序后的路径字典序（compareSolutions），全程确定。
+ * 返回 { indices, exact, nodes }：indices 为入选候选项下标，不可行时为 null；
+ * 搜索超出节点预算时 exact=false（indices 为已找到的最优上界，可能并非真正最优）。
+ */
+export function minimumCover(items: CoverItem[], universeMask: bigint): MinimumCoverResult {
+  if (universeMask === 0n) return { indices: [], exact: true, nodes: 0 };
+  // 空覆盖候选无意义；同覆盖候选项只保留段数最少、字典序最小者作为代表
+  const reps = new Map<bigint, number>();
+  items.forEach((it, idx) => {
+    if (it.cover === 0n) return;
+    const cur = reps.get(it.cover);
+    if (
+      cur === undefined ||
+      it.segments < items[cur].segments ||
+      (it.segments === items[cur].segments &&
+        compareSegments(it.pathSegments, items[cur].pathSegments) < 0)
+    ) {
+      reps.set(it.cover, idx);
+    }
+  });
+  const cand = [...reps.values()];
+
+  // 可达性：每个冲突对至少要被某个候选覆盖
+  let reach = 0n;
+  for (const idx of cand) reach |= items[idx].cover;
+  if ((reach & universeMask) !== universeMask) {
+    return { indices: null, exact: true, nodes: 0 };
+  }
+
+  // 每个冲突对的可覆盖候选表（按下标顺序）；可达性已保证每个位至少有一个候选
+  const covering: number[][] = [];
+  for (const idx of cand) {
+    let bits = items[idx].cover & universeMask;
+    while (bits > 0n) {
+      const bit = bits & -bits;
+      const i = bit.toString(2).length - 1;
+      if (!covering[i]) covering[i] = [];
+      covering[i].push(idx);
+      bits ^= bit;
+    }
+  }
+
+  const maxGain = Math.max(...cand.map((idx) => popcountBig(items[idx].cover & universeMask)));
+
+  /** 下界（对给定未覆盖掩码确定）：max(上取整比例下界, 独立集打包下界)。 */
+  const lowerBound = (remaining: bigint): number => {
+    const ratio = Math.ceil(popcountBig(remaining) / maxGain);
+    // 打包：不断取一个冲突对，剔除与之能被同一路径同时覆盖的对，计数加一
+    let rest = remaining;
+    let packing = 0;
+    while (rest > 0n) {
+      // 选可覆盖候选最少的对，得到不弱于任取低位的打包
+      let pick = -1;
+      let bestCount = Infinity;
+      let scan = rest;
+      while (scan > 0n) {
+        const bit = scan & -scan;
+        const i = bit.toString(2).length - 1;
+        const cnt = covering[i].filter((idx) => (items[idx].cover & rest) !== 0n).length;
+        if (cnt < bestCount) {
+          bestCount = cnt;
+          pick = i;
+        }
+        scan ^= bit;
+      }
+      packing++;
+      let co = 0n;
+      for (const idx of covering[pick]) co |= items[idx].cover;
+      rest &= ~co;
+    }
+    return Math.max(ratio, packing);
+  };
+
+  let best: number[] | null = null;
+  let bestSeg = Infinity;
+  const consider = (chosen: number[]) => {
+    // 首要目标是路径数：更少路径的方案无条件胜出，段数/字典序只在同路径数时比较
+    if (best === null || chosen.length < best.length) {
+      best = chosen.slice();
+      bestSeg = chosen.reduce((s, idx) => s + items[idx].segments, 0);
+      return;
+    }
+    if (chosen.length === best.length) {
+      const seg = chosen.reduce((s, idx) => s + items[idx].segments, 0);
+      // compareSolutions 内部先比总段数，再比排序后的路径字典序
+      const c = compareSolutions(
+        chosen.map((idx) => items[idx].pathSegments),
+        best.map((idx) => items[idx].pathSegments),
+        seg,
+        bestSeg,
+      );
+      if (c < 0) {
+        best = chosen.slice();
+        bestSeg = seg;
+      }
+    }
+  };
+
+  // 同一覆盖掩码到达过的最小路径数：更晚且步数严格更多的同状态必不更优；
+  // 步数相同的到达不能剪——其路径组合可能在段数/字典序决胜中更优
+  const bestCountForMask = new Map<bigint, number>();
+  let nodes = 0;
+  let truncated = false;
+
+  const dfs = (covered: bigint, chosen: number[]) => {
+    if (truncated) return;
+    nodes++;
+    if (nodes > MAX_SEARCH_NODES) {
+      truncated = true;
+      return;
+    }
+    const remaining = universeMask & ~covered;
+    if (remaining === 0n) {
+      consider(chosen);
+      return;
+    }
+    if (best !== null && chosen.length + lowerBound(remaining) > best.length) return;
+    const seen = bestCountForMask.get(covered);
+    if (seen !== undefined && chosen.length > seen) return;
+    if (seen === undefined || chosen.length < seen) bestCountForMask.set(covered, chosen.length);
+
+    // MRV：选可扩展候选最少的未覆盖冲突对
+    let target = -1;
+    let targetCount = Infinity;
+    let scan = remaining;
+    while (scan > 0n) {
+      const bit = scan & -scan;
+      const i = bit.toString(2).length - 1;
+      let cnt = 0;
+      for (const idx of covering[i]) if ((items[idx].cover & remaining) !== 0n) cnt++;
+      if (cnt < targetCount) {
+        targetCount = cnt;
+        target = i;
+      }
+      scan ^= bit;
+    }
+
+    // 分支顺序确定：新增覆盖多、段数少、字典序小者先（利于尽早得到紧的上界）
+    const branches = covering[target]
+      .filter((idx) => (items[idx].cover & remaining) !== 0n)
+      .sort((x, y) => {
+        const gx = popcountBig(items[x].cover & remaining);
+        const gy = popcountBig(items[y].cover & remaining);
+        if (gx !== gy) return gy - gx;
+        if (items[x].segments !== items[y].segments)
+          return items[x].segments - items[y].segments;
+        return compareSegments(items[x].pathSegments, items[y].pathSegments) || x - y;
+      });
+
+    for (const idx of branches) {
+      chosen.push(idx);
+      dfs(covered | items[idx].cover, chosen);
+      chosen.pop();
+    }
+  };
+
+  dfs(0n, []);
+  if (best === null) {
+    // 预算耗尽前连一个可行覆盖都未找到（理论上可达性保证可行，仅极端预算下发生）
+    return { indices: null, exact: false, nodes };
+  }
+  const result: number[] = best; // best 在递归闭包中赋值，显式标注避免被窄化为 never
+  return {
+    indices: result.slice().sort((x, y) => x - y),
+    exact: !truncated,
+    nodes,
+  };
+}
+
+/**
+ * 最小复现包：
+ *  - 从启用且合法的规则中选择 2～20 条；
+ *  - 以所选规则两两冲突对已有的最短见证路径（去重）为候选；
+ *  - 重新计算每条候选路径实际命中的已选规则及覆盖的冲突对；
+ *  - 用确定性分支限界选出覆盖全部冲突对的最少路径集合，
+ *    并列时依次按路径总段数、排序后的路径字典序决胜。
+ */
+export function reproPackage(inputs: RuleInput[], selectedIds: string[]): ReproPackage {
+  const { rules } = analyze(inputs);
+  const byId = new Map(rules.map((r) => [r.id, r]));
+  if (selectedIds.length < 2 || selectedIds.length > 20) {
+    throw new Error('复现包需要选择 2～20 条规则');
+  }
+  if (new Set(selectedIds).size !== selectedIds.length) {
+    throw new Error('选择的规则存在重复');
+  }
+  const selected: AnalyzedRule[] = [];
+  for (const id of selectedIds) {
+    const r = byId.get(id);
+    if (!r) throw new Error(`规则 ${id} 不存在`);
+    if (r.error) throw new Error(`规则 ${id} 非法，不能加入复现包`);
+    if (!r.enabled) throw new Error(`规则 ${id} 已禁用，不能加入复现包`);
+    selected.push(r);
+  }
+  selected.sort((x, y) => x.index - y.index);
+
+  // 所选规则之间的冲突对（复用两两最短见证）
+  const conflicts: ReproConflict[] = [];
+  for (let x = 0; x < selected.length; x++) {
+    for (let y = x + 1; y < selected.length; y++) {
+      const witnessSegs = intersectionWitness(selected[x].segments, selected[y].segments);
+      if (!witnessSegs) continue;
+      conflicts.push({
+        index: conflicts.length,
+        a: selected[x].id,
+        b: selected[y].id,
+        witness: '/' + witnessSegs.join('/'),
+      });
+    }
+  }
+
+  // 候选路径：冲突对已有见证路径去重（首次出现顺序保留）
+  const candidateSegs: string[][] = [];
+  const seenPaths = new Set<string>();
+  for (const c of conflicts) {
+    if (!seenPaths.has(c.witness)) {
+      seenPaths.add(c.witness);
+      candidateSegs.push(splitPath(c.witness));
+    }
+  }
+
+  // 重新计算每条候选实际命中的已选规则与覆盖的冲突对
+  const toReproPath = (segs: string[]): Omit<ReproPath, 'coveredConflicts'> & {
+    covered: Set<number>;
+  } => {
+    const hits = selected
+      .filter((r) => matchSegments(r.segments, segs))
+      .sort((x, y) => y.priority - x.priority || x.index - y.index);
+    const hitIds = new Set(hits.map((r) => r.id));
+    const covered = new Set<number>();
+    conflicts.forEach((c, i) => {
+      if (hitIds.has(c.a) && hitIds.has(c.b)) covered.add(i);
+    });
+    return {
+      path: '/' + segs.join('/'),
+      segments: segs.length,
+      matchedRules: hits.map((r) => r.id),
+      covered,
+    };
+  };
+
+  const computed = candidateSegs.map(toReproPath);
+
+  if (conflicts.length === 0) {
+    return {
+      selectedRuleIds: selected.map((r) => r.id),
+      conflicts,
+      candidates: computed.map(({ covered, ...rest }) => ({
+        ...rest,
+        coveredConflicts: [],
+      })),
+      paths: [],
+      conflictPairCount: 0,
+      candidateCount: computed.length,
+      pathCount: 0,
+      totalSegments: 0,
+    };
+  }
+
+  const universe = (1n << BigInt(conflicts.length)) - 1n;
+  const items: CoverItem[] = computed.map((p) => {
+    let cover = 0n;
+    for (const i of p.covered) cover |= 1n << BigInt(i);
+    return { cover, segments: p.segments, pathSegments: splitPath(p.path) };
+  });
+
+  const search = minimumCover(items, universe);
+  if (search.indices === null) throw new Error('候选见证路径无法覆盖全部冲突对（不应发生）');
+  if (!search.exact) {
+    throw new Error('冲突结构过于复杂，分支限界在预算内无法确认最优解；请减少选择的规则数量');
+  }
+  const chosen = search.indices;
+
+  // 入选路径按段序列字典序排列，保证展示与决胜口径一致
+  const chosenSorted = chosen.slice().sort((x, y) => {
+    const c = compareSegments(items[x].pathSegments, items[y].pathSegments);
+    return c !== 0 ? c : x - y;
+  });
+
+  return {
+    selectedRuleIds: selected.map((r) => r.id),
+    conflicts,
+    candidates: computed.map(({ covered, ...rest }) => ({
+      ...rest,
+      coveredConflicts: [...covered].sort((x, y) => x - y),
+    })),
+    paths: chosenSorted.map((idx) => ({
+      path: computed[idx].path,
+      segments: computed[idx].segments,
+      matchedRules: computed[idx].matchedRules,
+      coveredConflicts: [...computed[idx].covered].sort((x, y) => x - y),
+    })),
+    conflictPairCount: conflicts.length,
+    candidateCount: computed.length,
+    pathCount: chosenSorted.length,
+    totalSegments: chosenSorted.reduce((s, idx) => s + computed[idx].segments, 0),
   };
 }

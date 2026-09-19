@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { analyzeRules, matchPath } from './api';
 import type { AnalysisResult, MatchResult, RuleInput } from './types';
 import ImpactView from './ImpactView';
+import ReproView from './ReproView';
 
 const EXAMPLE = `# 每行一条规则：<优先级> <路由模式>
 # :param 匹配单个段，* 匹配零个或多个段
@@ -195,6 +196,7 @@ export default function App() {
           candidateInputs={candidateInputs}
         />
       ) : (
+      <>
       <main className="layout">
         <section className="panel">
           <h2>路由规则</h2>
@@ -333,6 +335,10 @@ export default function App() {
           )}
         </section>
       </main>
+      {analysis && enabledCount >= 2 && (
+        <ReproView analysis={analysis} ruleInputs={ruleInputs} />
+      )}
+      </>
       )}
     </div>
   );

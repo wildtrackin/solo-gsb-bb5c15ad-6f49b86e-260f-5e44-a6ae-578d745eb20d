@@ -9,6 +9,8 @@ import {
   splitPath,
   parseSampleLine,
   impact,
+  minimumCover,
+  reproPackage,
 } from '../dist/analyzer.js';
 
 const P = (s) => parsePattern(s);
@@ -210,5 +212,155 @@ const withDisabled = impact(
 );
 assert.equal(withDisabled.samples[0].category, 'unchanged');
 assert.equal(withDisabled.samples[0].baseline.priority, 1);
+
+// ---------- 最小集合覆盖：确定性分支限界（非贪心近似） ----------
+const C = (idxs) => idxs.reduce((m, i) => m | (1n << BigInt(i)), 0n);
+const item = (cover, segments, name) => ({
+  cover,
+  segments,
+  pathSegments: name.split('/').filter(Boolean),
+});
+
+// 空宇宙
+assert.deepEqual(minimumCover([], 0n), { indices: [], exact: true, nodes: 0 });
+// 不可行：第 1 位没有任何候选覆盖
+{
+  const r = minimumCover([item(1n, 1, '/a')], 3n);
+  assert.equal(r.indices, null);
+  assert.equal(r.exact, true);
+}
+// 经典贪心反例：贪心取大集合要 4 个，精确最优只要 3 个三角
+// 元素 0..5；三角 {0,1,2} {0,3,4} {0,5}，单边 {1}{2}{3}{4}{5}
+{
+  const items = [
+    item(C([0, 1, 2]), 1, '/a1'),
+    item(C([0, 3, 4]), 1, '/a2'),
+    item(C([0, 5]), 1, '/a3'),
+    item(C([1]), 1, '/e1'),
+    item(C([2]), 1, '/e2'),
+    item(C([3]), 1, '/e3'),
+    item(C([4]), 1, '/e4'),
+    item(C([5]), 1, '/e5'),
+  ];
+  const r = minimumCover(items, C([0, 1, 2, 3, 4, 5]));
+  assert.equal(r.exact, true);
+  assert.deepEqual(r.indices, [0, 1, 2]); // 3 个三角，而非 1 三角 + 4 单边
+}
+// 同覆盖候选去重后取段数少者
+{
+  const r = minimumCover([item(3n, 9, '/z'), item(3n, 2, '/m')], 3n);
+  assert.deepEqual(r.indices, [1]);
+}
+// 段数相同按字典序：/a/... 优于 /z/...
+{
+  const r = minimumCover(
+    [item(3n, 2, '/z/b'), item(3n, 2, '/a/z')],
+    3n,
+  );
+  assert.deepEqual(r.indices, [1]);
+}
+// 组合决胜：同大小、同覆盖结构，选总段数更少的组合
+{
+  // 必须各取一个：左半 {0}、右半 {1}；段数 (1,1) 优于 (1,9)
+  const r = minimumCover(
+    [
+      item(1n, 1, '/a'),
+      item(1n, 9, '/zzz'),
+      item(2n, 1, '/b'),
+      item(2n, 9, '/yyy'),
+    ],
+    3n,
+  );
+  assert.deepEqual(r.indices, [0, 2]);
+}
+// 排序后的路径字典序决胜：两个同大小方案 {/a,/d} vs {/b,/c}，前者字典序更小
+{
+  const r = minimumCover(
+    [
+      item(1n, 1, '/a'),
+      item(1n, 1, '/b'),
+      item(2n, 1, '/d'),
+      item(2n, 1, '/c'),
+    ],
+    3n,
+  );
+  // /a + /c（下标 0、3）或 /b + /d（下标 1、2）都覆盖；排序后 ['a','c'] < ['b','d']
+  assert.deepEqual(r.indices, [0, 3]);
+}
+
+// ---------- 最小复现包 ----------
+const reproRules = [
+  { pattern: '/api/users/:id', priority: 100, enabled: true },
+  { pattern: '/api/users/new', priority: 10, enabled: true },
+  { pattern: '/api/*', priority: 1, enabled: true },
+  { pattern: '/health', priority: 0, enabled: true },
+];
+{
+  const pkg = reproPackage(reproRules, ['R1', 'R2', 'R3']);
+  assert.deepEqual(pkg.selectedRuleIds, ['R1', 'R2', 'R3']);
+  assert.equal(pkg.conflictPairCount, 3);
+  // 一条 /api/users/new 同时命中三条已选规则，覆盖全部 3 个冲突对
+  assert.equal(pkg.pathCount, 1);
+  assert.equal(pkg.paths[0].path, '/api/users/new');
+  assert.deepEqual(pkg.paths[0].matchedRules, ['R1', 'R2', 'R3']);
+  assert.deepEqual(pkg.paths[0].coveredConflicts, [0, 1, 2]);
+  assert.equal(pkg.totalSegments, 3);
+  // 每条入选路径都必须确实覆盖它声称的全部冲突对
+  for (const p of pkg.paths) {
+    const hit = new Set(p.matchedRules);
+    for (const ci of p.coveredConflicts) {
+      assert.ok(hit.has(pkg.conflicts[ci].a) && hit.has(pkg.conflicts[ci].b));
+    }
+  }
+  // 所有冲突对恰好被入选路径覆盖（无遗漏）
+  const coveredAll = new Set();
+  pkg.paths.forEach((p) => p.coveredConflicts.forEach((i) => coveredAll.add(i)));
+  assert.equal(coveredAll.size, pkg.conflictPairCount);
+  // 入选择顺序为路径字典序
+  const lex = pkg.paths.map((p) => p.path).slice().sort();
+  assert.deepEqual(pkg.paths.map((p) => p.path), lex);
+}
+// 两条互不冲突的已选规则：0 个冲突对、0 条入选路径
+{
+  const pkg = reproPackage(reproRules, ['R3', 'R4']);
+  assert.equal(pkg.conflictPairCount, 0);
+  assert.equal(pkg.pathCount, 0);
+  assert.deepEqual(pkg.paths, []);
+}
+// 入参校验
+assert.throws(() => reproPackage(reproRules, ['R1']), /2～20/);
+assert.throws(
+  () => reproPackage(reproRules, ['R1', 'R1', 'R2']),
+  /重复/,
+);
+assert.throws(
+  () => reproPackage([...reproRules, { pattern: '/:/', priority: 0, enabled: true }], [
+    'R1',
+    'R5',
+  ]),
+  /非法/,
+);
+assert.throws(
+  () => reproPackage(reproRules.map((r, i) => (i === 3 ? { ...r, enabled: false } : r)), [
+    'R1',
+    'R4',
+  ]),
+  /禁用/,
+);
+assert.throws(() => reproPackage(reproRules, ['R1', 'R99']), /不存在/);
+
+// 复现包最优性（端到端）：见证路径命中第三条规则时，单路径即可覆盖多个冲突对
+{
+  const rules = [
+    { pattern: '/:x/b', priority: 1, enabled: true },
+    { pattern: '/a/:y', priority: 1, enabled: true },
+    { pattern: '/a/b', priority: 10, enabled: true },
+  ];
+  const pkg = reproPackage(rules, ['R1', 'R2', 'R3']);
+  // /a/b 同时命中三条，一条路径覆盖全部 3 对
+  assert.equal(pkg.pathCount, 1);
+  assert.equal(pkg.paths[0].path, '/a/b');
+  assert.deepEqual(pkg.paths[0].coveredConflicts, [0, 1, 2]);
+}
 
 console.log('✔ analyzer 全部测试通过');

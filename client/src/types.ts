@@ -75,3 +75,29 @@ export interface ImpactResult {
   invalidSamples: InvalidSample[];
   summary: Record<ImpactCategory, CategorySummary> & { total: CategorySummary };
 }
+
+// ---------- 最小复现包 ----------
+export interface ReproConflict {
+  index: number;
+  a: string;
+  b: string;
+  witness: string;
+}
+
+export interface ReproPath {
+  path: string;
+  segments: number;
+  matchedRules: string[];
+  coveredConflicts: number[];
+}
+
+export interface ReproPackage {
+  selectedRuleIds: string[];
+  conflicts: ReproConflict[];
+  candidates: ReproPath[];
+  paths: ReproPath[];
+  conflictPairCount: number;
+  candidateCount: number;
+  pathCount: number;
+  totalSegments: number;
+}

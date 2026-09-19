@@ -1,6 +1,6 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
-import { analyze, simulate, impact, RuleInput } from './analyzer';
+import { analyze, simulate, impact, reproPackage, RuleInput } from './analyzer';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -81,6 +81,32 @@ app.post('/api/impact', (req: Request, res: Response) => {
   }
   const samples = (samplesRaw as string[]).map((s) => s.slice(0, MAX_SAMPLE_LINE_LEN));
   res.json(impact(baseline, candidate, samples));
+});
+
+app.post('/api/repro', (req: Request, res: Response) => {
+  const body = req.body as Record<string, unknown> | null;
+  if (body === null || typeof body !== 'object') {
+    res.status(400).json({ error: '请求非法：需要 JSON 对象' });
+    return;
+  }
+  const rules = sanitizeRuleList(body.rules);
+  const selectedRaw = body.selectedRuleIds;
+  if (
+    !rules ||
+    !Array.isArray(selectedRaw) ||
+    selectedRaw.length > 20 ||
+    !selectedRaw.every((id) => typeof id === 'string')
+  ) {
+    res.status(400).json({
+      error: `请求非法：需要 rules 数组（至多 ${MAX_RULES} 条）和 selectedRuleIds 字符串数组（2～20 条）`,
+    });
+    return;
+  }
+  try {
+    res.json(reproPackage(rules, selectedRaw as string[]));
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 app.get('/api/health', (_req: Request, res: Response) => {

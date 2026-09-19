@@ -326,3 +326,80 @@ code {
   max-height: 200px;
   overflow-y: auto;
 }
+
+/* ---------- 最小复现包 ---------- */
+.repro-panel {
+  margin-top: 20px;
+}
+
+.repro-intro {
+  margin: 0 0 12px;
+  line-height: 1.6;
+}
+
+.repro-rule-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+  max-height: 168px;
+  overflow-y: auto;
+  padding: 8px;
+  background: #0b101c;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+}
+
+.repro-rule {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+  font-size: 12.5px;
+  cursor: pointer;
+  user-select: none;
+  opacity: 0.62;
+}
+
+.repro-rule-on {
+  opacity: 1;
+  border-color: var(--accent);
+  background: rgba(79, 140, 255, 0.14);
+}
+
+.repro-rule input {
+  margin: 0;
+}
+
+.repro-rule-pattern {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repro-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.btn-secondary {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--panel-border);
+}
+
+.btn-secondary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.repro-error {
+  margin: 0 0 10px;
+}
+
+.repro-panel .badge {
+  margin-right: 4px;
+}
