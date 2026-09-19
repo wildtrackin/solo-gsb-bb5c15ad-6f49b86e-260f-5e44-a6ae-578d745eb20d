@@ -9,6 +9,8 @@ import {
   splitPath,
   parseSampleLine,
   impact,
+  buildRepro,
+  selectMinCover,
 } from '../dist/analyzer.js';
 
 const P = (s) => parsePattern(s);
@@ -210,5 +212,172 @@ const withDisabled = impact(
 );
 assert.equal(withDisabled.samples[0].category, 'unchanged');
 assert.equal(withDisabled.samples[0].baseline.priority, 1);
+
+// ---------- 最小复现包 ----------
+// 共享见证：/a/b 同时命中三条规则，一条路径即可覆盖全部 3 组冲突
+const reproRules1 = [
+  { pattern: '/a/*', priority: 1, enabled: true }, // R1
+  { pattern: '/a/b', priority: 2, enabled: true }, // R2
+  { pattern: '/a/:x', priority: 3, enabled: true }, // R3
+];
+const repro1 = buildRepro(reproRules1, ['R1', 'R2', 'R3']);
+assert.equal(repro1.totalConflicts, 3);
+assert.equal(repro1.candidatePaths, 2); // 去重后：/a/b、/a/x
+assert.equal(repro1.paths.length, 1); // 而非按冲突逐条保留 3 条
+assert.equal(repro1.paths[0].path, '/a/b');
+assert.deepEqual(repro1.paths[0].hits, ['R3', 'R2', 'R1']); // 按胜出顺序
+assert.deepEqual(
+  repro1.paths[0].covers,
+  [
+    { a: 'R1', b: 'R2' },
+    { a: 'R1', b: 'R3' },
+    { a: 'R2', b: 'R3' },
+  ],
+);
+// 复现包自包含：胜出模拟限制在所选规则内
+const ids1 = new Set(['R1', 'R2', 'R3']);
+assert.ok(repro1.conflicts.every((c) => c.winner === null || ids1.has(c.winner)));
+
+// 自包含的胜出模拟：集外高优先级规则不参与复现包内的胜出判定
+const reproSelf = buildRepro(
+  [
+    { pattern: '/a/:x', priority: 1, enabled: true }, // R1
+    { pattern: '/a/b', priority: 2, enabled: true }, // R2
+    { pattern: '/a/b', priority: 100, enabled: true }, // R3 不纳入选择
+  ],
+  ['R1', 'R2'],
+);
+assert.equal(reproSelf.conflicts.length, 1);
+assert.equal(reproSelf.conflicts[0].winner, 'R2'); // 不被集外 R3 截胡
+// 对照：全量分析中同一冲突对的胜出者是集外的 R3
+const fullAnalysis = analyze([
+  { pattern: '/a/:x', priority: 1, enabled: true },
+  { pattern: '/a/b', priority: 2, enabled: true },
+  { pattern: '/a/b', priority: 100, enabled: true },
+]);
+assert.equal(fullAnalysis.conflicts[0].winner, 'R3');
+
+// 两组独立冲突 → 最少需要 2 条路径
+const repro2 = buildRepro(
+  [
+    { pattern: '/a/:x', priority: 1, enabled: true }, // R1
+    { pattern: '/a/b', priority: 1, enabled: true }, // R2
+    { pattern: '/c/:y', priority: 1, enabled: true }, // R3
+    { pattern: '/c/d', priority: 1, enabled: true }, // R4
+  ],
+  ['R1', 'R2', 'R3', 'R4'],
+);
+assert.equal(repro2.totalConflicts, 2);
+assert.equal(repro2.paths.length, 2);
+assert.deepEqual(
+  repro2.paths.map((p) => p.path),
+  ['/a/b', '/c/d'],
+);
+assert.deepEqual(repro2.paths[0].covers, [{ a: 'R1', b: 'R2' }]);
+assert.deepEqual(repro2.paths[1].covers, [{ a: 'R3', b: 'R4' }]);
+
+// 所选规则之间无冲突 → 空复现包（合法结果，非错误）
+const repro3 = buildRepro(
+  [
+    { pattern: '/a', priority: 1, enabled: true },
+    { pattern: '/b', priority: 1, enabled: true },
+  ],
+  ['R1', 'R2'],
+);
+assert.equal(repro3.totalConflicts, 0);
+assert.equal(repro3.paths.length, 0);
+
+// 确定性：相同输入重复计算结果完全一致
+assert.deepEqual(buildRepro(reproRules1, ['R3', 'R1', 'R2']), repro1); // 选择顺序无关
+
+// 非法选择：数量、重复、不存在、禁用、非法规则
+assert.throws(() => buildRepro(reproRules1, ['R1']), /2～20/);
+assert.throws(() => buildRepro(reproRules1, ['R1', 'R1']), /重复/);
+assert.throws(() => buildRepro(reproRules1, ['R1', 'R9']), /不存在/);
+assert.throws(
+  () =>
+    buildRepro(
+      [
+        { pattern: '/a', priority: 1, enabled: false },
+        { pattern: '/b', priority: 1, enabled: true },
+      ],
+      ['R1', 'R2'],
+    ),
+  /禁用/,
+);
+assert.throws(
+  () =>
+    buildRepro(
+      [
+        { pattern: '/a/b*c', priority: 1, enabled: true },
+        { pattern: '/b', priority: 1, enabled: true },
+      ],
+      ['R1', 'R2'],
+    ),
+  /非法/,
+);
+// 超过 20 条
+const manyRules = Array.from({ length: 21 }, (_, i) => ({
+  pattern: `/p${i}/:x`,
+  priority: 1,
+  enabled: true,
+}));
+assert.throws(
+  () => buildRepro(manyRules, manyRules.map((_, i) => `R${i + 1}`)),
+  /2～20/,
+);
+// 恰好 20 条合法（互无冲突 → 空复现包）
+const twenty = manyRules.slice(0, 20);
+const repro20 = buildRepro(twenty, twenty.map((_, i) => `R${i + 1}`));
+assert.equal(repro20.totalConflicts, 0);
+
+// ---------- selectMinCover：精确最小覆盖与决胜规则 ----------
+// 最小性：一条候选覆盖全部 → 不逐条保留
+assert.deepEqual(
+  selectMinCover([[0, 1, 2], [0], [1], [2]], [1, 1, 1, 1], ['/all', '/a', '/b', '/c'], 3),
+  [0],
+);
+// 路径数优先于总段数：1 条长路径胜过 2 条短路径
+assert.deepEqual(
+  selectMinCover(
+    [[0, 1], [0], [1]],
+    [5, 1, 1],
+    ['/long/path/here', '/a', '/b'],
+    2,
+  ),
+  [0],
+);
+// 路径数并列 → 总段数少者胜
+assert.deepEqual(
+  selectMinCover([[0], [0]], [3, 1], ['/a/b/c', '/d'], 1),
+  [1],
+);
+// 总段数并列 → 排序后路径字典序小者胜
+assert.deepEqual(
+  selectMinCover([[0], [0]], [1, 1], ['/b', '/a'], 1),
+  [1],
+);
+// 多解组合并列：{0,3} 与 {1,2} 大小相同 → 比总段数
+assert.deepEqual(
+  selectMinCover(
+    [[0], [0], [1], [1]],
+    [1, 9, 9, 1],
+    ['/a', '/bbbbbbbbb', '/ccccccccc', '/d'],
+    2,
+  ),
+  [0, 3],
+);
+// 总段数也相同 → 集合内排序后字典序：[/a,/c] 胜过 [/a,/d]、[/b,/c]、[/b,/d]
+assert.deepEqual(
+  selectMinCover(
+    [[0], [0], [1], [1]],
+    [1, 1, 1, 1],
+    ['/b', '/a', '/d', '/c'],
+    2,
+  ),
+  [1, 3],
+);
+// 空全集 → 空解
+assert.deepEqual(selectMinCover([], [], [], 0), []);
 
 console.log('✔ analyzer 全部测试通过');

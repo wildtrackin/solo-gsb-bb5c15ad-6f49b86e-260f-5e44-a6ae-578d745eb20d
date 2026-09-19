@@ -1,6 +1,14 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
-import { analyze, simulate, impact, RuleInput } from './analyzer';
+import {
+  analyze,
+  simulate,
+  impact,
+  buildRepro,
+  MIN_REPRO_RULES,
+  MAX_REPRO_RULES,
+  RuleInput,
+} from './analyzer';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -9,6 +17,7 @@ const MAX_RULES = 500;
 const MAX_PATTERN_LEN = 500;
 const MAX_SAMPLE_LINES = 5000;
 const MAX_SAMPLE_LINE_LEN = 500;
+const MAX_RULE_ID_LEN = 20;
 
 /** 清洗客户端提交的单条规则，返回安全的 RuleInput。 */
 function sanitizeRule(raw: unknown): RuleInput | null {
@@ -81,6 +90,28 @@ app.post('/api/impact', (req: Request, res: Response) => {
   }
   const samples = (samplesRaw as string[]).map((s) => s.slice(0, MAX_SAMPLE_LINE_LEN));
   res.json(impact(baseline, candidate, samples));
+});
+
+app.post('/api/repro', (req: Request, res: Response) => {
+  const rules = sanitizeRules(req.body);
+  const ruleIds = (req.body as Record<string, unknown> | null)?.ruleIds;
+  if (
+    !rules ||
+    !Array.isArray(ruleIds) ||
+    ruleIds.length < MIN_REPRO_RULES ||
+    ruleIds.length > MAX_REPRO_RULES ||
+    !ruleIds.every((id) => typeof id === 'string' && id.length <= MAX_RULE_ID_LEN)
+  ) {
+    res.status(400).json({
+      error: `请求非法：需要 rules 数组和 ruleIds 字符串数组（${MIN_REPRO_RULES}～${MAX_REPRO_RULES} 条）`,
+    });
+    return;
+  }
+  try {
+    res.json(buildRepro(rules, ruleIds as string[]));
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 app.get('/api/health', (_req: Request, res: Response) => {

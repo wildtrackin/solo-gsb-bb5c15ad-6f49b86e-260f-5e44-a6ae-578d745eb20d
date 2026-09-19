@@ -326,3 +326,23 @@ code {
   max-height: 200px;
   overflow-y: auto;
 }
+
+/* ---------- 最小复现包 ---------- */
+.hit-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 10px;
+}
+
+.cover-list {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  vertical-align: middle;
+}
+
+.badge-cover {
+  background: rgba(79, 140, 255, 0.14);
+  color: #9db9ff;
+}

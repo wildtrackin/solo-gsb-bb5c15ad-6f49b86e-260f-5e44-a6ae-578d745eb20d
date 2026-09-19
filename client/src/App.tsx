@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { analyzeRules, matchPath } from './api';
-import type { AnalysisResult, MatchResult, RuleInput } from './types';
+import { analyzeRules, matchPath, computeRepro } from './api';
+import type { AnalysisResult, MatchResult, ReproResult, RuleInput } from './types';
 import ImpactView from './ImpactView';
+
+const MAX_REPRO_RULES = 20; // 与后端一致：复现包最多选择的规则数
 
 const EXAMPLE = `# 每行一条规则：<优先级> <路由模式>
 # :param 匹配单个段，* 匹配零个或多个段
@@ -64,6 +66,9 @@ export default function App() {
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
   const [testPath, setTestPath] = useState('/api/users/new');
   const [matchResult, setMatchResult] = useState<MatchResult | null>(null);
+  const [reproSelected, setReproSelected] = useState<Set<number>>(new Set());
+  const [repro, setRepro] = useState<ReproResult | null>(null);
+  const [reproError, setReproError] = useState<string | null>(null);
 
   // 文本 → 规则输入（含启用状态）
   const ruleInputs: RuleInput[] = useMemo(() => toRuleInputs(text, disabled), [text, disabled]);
@@ -120,6 +125,48 @@ export default function App() {
     });
   };
 
+  const toggleReproRule = (index: number) => {
+    setReproSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  };
+
+  // 实际纳入复现包的规则 id：仅启用且合法的被勾选规则
+  const reproIds: string[] = useMemo(() => {
+    if (!analysis) return [];
+    return analysis.rules
+      .filter((r) => reproSelected.has(r.index) && r.enabled && !r.error)
+      .map((r) => r.id);
+  }, [analysis, reproSelected]);
+
+  // 复现包：选择或规则变化后防抖重算；序号守卫丢弃过期响应
+  const reproSeq = useRef(0);
+  useEffect(() => {
+    const seq = ++reproSeq.current;
+    if (reproIds.length < 2 || reproIds.length > MAX_REPRO_RULES) {
+      setRepro(null);
+      setReproError(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      computeRepro(ruleInputs, reproIds)
+        .then((result) => {
+          if (seq !== reproSeq.current) return;
+          setRepro(result);
+          setReproError(null);
+        })
+        .catch((err: Error) => {
+          if (seq !== reproSeq.current) return;
+          setRepro(null);
+          setReproError(err.message);
+        });
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [ruleInputs, reproIds]);
+
   const ruleById = useMemo(() => {
     const map = new Map<string, AnalysisResult['rules'][number]>();
     analysis?.rules.forEach((r) => map.set(r.id, r));
@@ -153,6 +200,44 @@ export default function App() {
     const a = document.createElement('a');
     a.href = url;
     a.download = `route-conflicts-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadRepro = () => {
+    if (!repro) return;
+    const payload = {
+      tool: 'api-gateway-route-ambiguity-analyzer',
+      mode: 'minimal-repro',
+      exportedAt: new Date().toISOString(),
+      rules: repro.rules.map((r) => ({
+        id: r.id,
+        pattern: r.pattern,
+        priority: r.priority,
+        enabled: r.enabled,
+      })),
+      conflicts: repro.conflicts.map((c) => ({
+        ruleA: c.a,
+        ruleB: c.b,
+        witness: c.witness,
+        winner: c.winner,
+        winnerInPair: c.winnerInPair,
+      })),
+      totalConflicts: repro.totalConflicts,
+      candidatePaths: repro.candidatePaths,
+      paths: repro.paths.map((p) => ({
+        path: p.path,
+        hits: p.hits,
+        covers: p.covers.map((c) => ({ ruleA: c.a, ruleB: c.b })),
+      })),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: 'application/json',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `route-repro-${Date.now()}.json`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -224,13 +309,16 @@ export default function App() {
               <thead>
                 <tr>
                   <th>启用</th>
+                  <th title="勾选 2～20 条启用且合法的规则生成最小复现包">复现</th>
                   <th>ID</th>
                   <th>模式</th>
                   <th>优先级</th>
                 </tr>
               </thead>
               <tbody>
-                {analysis.rules.map((rule) => (
+                {analysis.rules.map((rule) => {
+                  const usable = rule.enabled && !rule.error;
+                  return (
                   <tr
                     key={rule.id}
                     className={rule.enabled ? '' : 'row-disabled'}
@@ -243,6 +331,14 @@ export default function App() {
                         onChange={() => toggleRule(rule.index)}
                       />
                     </td>
+                    <td>
+                      <input
+                        type="checkbox"
+                        checked={usable && reproSelected.has(rule.index)}
+                        disabled={!usable}
+                        onChange={() => toggleReproRule(rule.index)}
+                      />
+                    </td>
                     <td className="mono">{rule.id}</td>
                     <td className="mono">
                       {rule.pattern}
@@ -250,7 +346,8 @@ export default function App() {
                     </td>
                     <td className="mono">{rule.priority}</td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           )}
@@ -330,6 +427,69 @@ export default function App() {
                 <div className="muted">没有规则命中 {matchResult.path}</div>
               )}
             </div>
+          )}
+
+          <h2>最小复现包</h2>
+          {reproIds.length < 2 ? (
+            <p className="muted">
+              在左侧规则表「复现」列勾选 2～{MAX_REPRO_RULES}{' '}
+              条启用且合法的规则，后端将从已有的去重冲突见证路径中精确选出覆盖全部冲突对的最少路径集合。
+            </p>
+          ) : reproIds.length > MAX_REPRO_RULES ? (
+            <p className="warn-text">
+              最多选择 {MAX_REPRO_RULES} 条规则（当前 {reproIds.length} 条），请减少勾选。
+            </p>
+          ) : reproError ? (
+            <p className="error-text">计算失败：{reproError}</p>
+          ) : !repro ? (
+            <p className="muted">计算中…</p>
+          ) : repro.totalConflicts === 0 ? (
+            <p className="muted">所选的 {reproIds.length} 条规则之间没有冲突，无需复现。</p>
+          ) : (
+            <>
+              <div className="status-line">
+                <span>
+                  <strong>{repro.paths.length}</strong> 条路径覆盖全部 {repro.totalConflicts}{' '}
+                  组冲突（候选见证 {repro.candidatePaths} 条）
+                </span>
+                <button className="btn" onClick={downloadRepro}>
+                  下载复现包 JSON
+                </button>
+              </div>
+              <div className="conflict-list">
+                {repro.paths.map((p) => (
+                  <div className="conflict-card" key={p.path}>
+                    <div className="conflict-head">
+                      <code className="witness">{p.path}</code>
+                    </div>
+                    <div className="conflict-body">
+                      <div>
+                        实际命中：
+                        {p.hits.map((id) => {
+                          const rule = ruleById.get(id);
+                          return (
+                            <span className="hit-item" key={id}>
+                              <span className="badge">{id}</span>
+                              <span className="mono muted">{rule?.pattern}</span>
+                            </span>
+                          );
+                        })}
+                      </div>
+                      <div>
+                        覆盖冲突对：
+                        <span className="cover-list">
+                          {p.covers.map((c) => (
+                            <span className="badge badge-cover" key={`${c.a}-${c.b}`}>
+                              {c.a} × {c.b}
+                            </span>
+                          ))}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
           )}
         </section>
       </main>

@@ -90,6 +90,28 @@ export interface ImpactResult {
   summary: Record<ImpactCategory, CategorySummary> & { total: CategorySummary };
 }
 
+/** 复现包中一条入选路径覆盖的冲突对。 */
+export interface ReproConflict {
+  a: string; // 规则 id
+  b: string;
+}
+
+/** 复现包中入选的一条见证路径。 */
+export interface ReproPath {
+  path: string; // 具体请求路径
+  hits: string[]; // 实际命中的所选规则 id，按胜出顺序排列
+  covers: ReproConflict[]; // 该路径实际覆盖的冲突对
+}
+
+/** 最小复现包：覆盖所选规则全部冲突对的最少见证路径集合。 */
+export interface ReproResult {
+  rules: AnalyzedRule[]; // 所选规则（按输入顺序）
+  conflicts: ConflictPair[]; // 所选规则之间的全部冲突对
+  candidatePaths: number; // 去重后的候选见证路径数
+  totalConflicts: number; // 冲突对总数（= conflicts.length）
+  paths: ReproPath[]; // 入选的最少路径集合（按路径字典序）
+}
+
 const PARAM_PLACEHOLDER = 'x'; // 见证路径中为参数段生成的具体值
 const MAX_SAMPLE_COUNT = 1_000_000_000; // 单条样本允许的最大请求次数
 
@@ -401,5 +423,248 @@ export function impact(
     samples,
     invalidSamples,
     summary,
+  };
+}
+
+/** bigint 位掩码的 popcount。 */
+function popcountBig(x: bigint): number {
+  let c = 0;
+  let v = x;
+  while (v !== 0n) {
+    v &= v - 1n;
+    c++;
+  }
+  return c;
+}
+
+/**
+ * 确定性分支限界求最小集合覆盖（精确算法，非贪心）。
+ *
+ * covers[i] 为候选 i 覆盖的冲突对下标列表；目标是选出覆盖全部 universeSize
+ * 个冲突对的最少候选集合。并列时依次按以下规则决胜，保证结果唯一确定：
+ *  1. 候选路径总段数少者优先；
+ *  2. 集合内路径字符串排序后，字典序小者优先。
+ *
+ * 分支策略：每次选择“可用覆盖者最少”的未覆盖冲突对进行分支；第 j 个分支
+ * 禁止再选前 j-1 个覆盖者，保证每个解恰好生成一次。剪枝下界为
+ * 已选数 + ⌈剩余冲突对数 / 单候选最大剩余覆盖数⌉。
+ *
+ * 返回入选候选的下标，按路径字典序排列。
+ */
+export function selectMinCover(
+  covers: number[][],
+  segCounts: number[],
+  paths: string[],
+  universeSize: number,
+): number[] {
+  const n = covers.length;
+  if (universeSize === 0 || n === 0) return [];
+
+  // 候选按路径字典序排序，保证分支顺序确定
+  const order = Array.from({ length: n }, (_, i) => i).sort((x, y) =>
+    paths[x] < paths[y] ? -1 : paths[x] > paths[y] ? 1 : x - y,
+  );
+  const mask = order.map((orig) => {
+    let m = 0n;
+    for (const bit of covers[orig]) m |= 1n << BigInt(bit);
+    return m;
+  });
+  const segs = order.map((orig) => segCounts[orig]);
+  const keys = order.map((orig) => paths[orig]);
+  const full = (1n << BigInt(universeSize)) - 1n;
+
+  // coverers[b]：覆盖冲突对 b 的候选（按路径字典序）
+  const coverers: number[][] = Array.from({ length: universeSize }, () => []);
+  for (let si = 0; si < n; si++) {
+    let m = mask[si];
+    let b = 0;
+    while (m !== 0n) {
+      if (m & 1n) coverers[b].push(si);
+      m >>= 1n;
+      b++;
+    }
+  }
+
+  interface Solution {
+    count: number;
+    segs: number;
+    keys: string[]; // 集合内路径按字典序排列
+  }
+  let best: Solution | null = null;
+  let bestSel: number[] = [];
+
+  const avail = new Array<boolean>(n).fill(true);
+  const chosen: number[] = [];
+  let chosenSegs = 0;
+  let covered = 0n;
+
+  const isBetter = (sel: number[], totalSegs: number): boolean => {
+    if (!best) return true;
+    if (sel.length !== best.count) return sel.length < best.count;
+    if (totalSegs !== best.segs) return totalSegs < best.segs;
+    for (let k = 0; k < sel.length; k++) {
+      const a = keys[sel[k]];
+      const b = best.keys[k];
+      if (a !== b) return a < b;
+    }
+    return false;
+  };
+
+  const search = (): void => {
+    if (covered === full) {
+      const sel = [...chosen].sort((x, y) => x - y); // 排序空间下标升序 = 路径字典序
+      if (isBetter(sel, chosenSegs)) {
+        best = { count: sel.length, segs: chosenSegs, keys: sel.map((si) => keys[si]) };
+        bestSel = sel;
+      }
+      return;
+    }
+    const remaining = full & ~covered;
+    // 找“可用覆盖者最少”的未覆盖冲突对作为分支目标，并统计下界所需数据
+    let remainingCount = 0;
+    let maxCover = 0;
+    let targetCoverers: number[] | null = null;
+    for (let b = 0; b < universeSize; b++) {
+      if (!((remaining >> BigInt(b)) & 1n)) continue;
+      remainingCount++;
+      const cov = coverers[b].filter((si) => avail[si]);
+      if (cov.length === 0) return; // 有冲突对无法覆盖（理论上不会发生）
+      if (targetCoverers === null || cov.length < targetCoverers.length) {
+        targetCoverers = cov;
+      }
+    }
+    for (let si = 0; si < n; si++) {
+      if (!avail[si]) continue;
+      const c = popcountBig(mask[si] & remaining);
+      if (c > maxCover) maxCover = c;
+    }
+    if (maxCover === 0 || targetCoverers === null) return;
+    const lowerBound = chosen.length + Math.ceil(remainingCount / maxCover);
+    if (best !== null) {
+      const b = best as Solution;
+      if (lowerBound > b.count) return;
+      // 路径数已不可能更少，且段数只增不减，已超过最优段数时剪枝
+      if (lowerBound === b.count && chosenSegs > b.segs) return;
+    }
+    // 分支：按字典序依次尝试 target 的覆盖者；第 j 个分支禁止再选
+    // targetCoverers[0..j-1]，保证每个解恰好生成一次
+    const banned: number[] = [];
+    for (const si of targetCoverers) {
+      chosen.push(si);
+      chosenSegs += segs[si];
+      const saved = covered;
+      covered |= mask[si];
+      avail[si] = false;
+      search();
+      covered = saved;
+      chosen.pop();
+      chosenSegs -= segs[si];
+      banned.push(si); // avail[si] 保持 false，对后续兄弟分支生效
+    }
+    for (const si of banned) avail[si] = true;
+  };
+
+  search();
+  return bestSel.map((si) => order[si]);
+}
+
+export const MIN_REPRO_RULES = 2;
+export const MAX_REPRO_RULES = 20;
+
+/**
+ * 最小复现包：从所选规则（2～20 条启用且合法）已有的去重冲突见证路径出发，
+ * 重新计算每条路径实际命中的规则与覆盖的冲突对，用确定性分支限界选出覆盖
+ * 全部冲突对的最少路径集合。选择非法时抛出 Error。
+ */
+export function buildRepro(inputs: RuleInput[], selectedIds: string[]): ReproResult {
+  const { rules } = analyze(inputs);
+  const byId = new Map(rules.map((r) => [r.id, r]));
+  if (
+    !Array.isArray(selectedIds) ||
+    selectedIds.length < MIN_REPRO_RULES ||
+    selectedIds.length > MAX_REPRO_RULES
+  ) {
+    throw new Error(`需选择 ${MIN_REPRO_RULES}～${MAX_REPRO_RULES} 条规则`);
+  }
+  const seen = new Set<string>();
+  const selected: AnalyzedRule[] = [];
+  for (const id of selectedIds) {
+    const rule = byId.get(id);
+    if (!rule) throw new Error(`规则 ${id} 不存在`);
+    if (seen.has(id)) throw new Error(`规则 ${id} 被重复选择`);
+    seen.add(id);
+    if (!rule.enabled) throw new Error(`规则 ${id} 已禁用，不能纳入复现包`);
+    if (rule.error) throw new Error(`规则 ${id} 非法：${rule.error}`);
+    selected.push(rule);
+  }
+  // 输出与后续冲突对顺序按规则输入顺序确定，与选择顺序无关
+  selected.sort((x, y) => x.index - y.index);
+
+  // 所选规则之间的全部冲突对；胜出模拟同样限制在所选集合内，保证复现包自包含
+  const conflicts: ConflictPair[] = [];
+  for (let x = 0; x < selected.length; x++) {
+    for (let y = x + 1; y < selected.length; y++) {
+      const ra = selected[x];
+      const rb = selected[y];
+      const witnessSegs = intersectionWitness(ra.segments, rb.segments);
+      if (!witnessSegs) continue;
+      const winner = findWinner(selected, witnessSegs);
+      conflicts.push({
+        a: ra.id,
+        b: rb.id,
+        witness: '/' + witnessSegs.join('/'),
+        winner: winner ? winner.id : null,
+        winnerInPair: winner !== null && (winner.id === ra.id || winner.id === rb.id),
+      });
+    }
+  }
+
+  // 候选：已有的去重冲突见证路径
+  const candidates = [...new Set(conflicts.map((c) => c.witness))];
+
+  // 重新计算每条候选路径实际命中的所选规则与覆盖的冲突对
+  const conflictIndex: Map<string, number> = new Map(
+    conflicts.map((c, i) => [`${c.a}|${c.b}`, i] as [string, number]),
+  );
+  const keyOf = (idX: string, idY: string): string => {
+    const rx = byId.get(idX)!;
+    const ry = byId.get(idY)!;
+    return rx.index < ry.index ? `${idX}|${idY}` : `${idY}|${idX}`;
+  };
+  const hitsPerPath: string[][] = [];
+  const covers: number[][] = [];
+  const segCounts: number[] = [];
+  for (const path of candidates) {
+    const pathSegs = splitPath(path);
+    segCounts.push(pathSegs.length);
+    const hits = selected
+      .filter((r) => matchSegments(r.segments, pathSegs))
+      .sort((x, y) => y.priority - x.priority || x.index - y.index)
+      .map((r) => r.id);
+    hitsPerPath.push(hits);
+    const cov = new Set<number>();
+    for (let i = 0; i < hits.length; i++) {
+      for (let j = i + 1; j < hits.length; j++) {
+        // 同时命中同一条具体路径的两条规则必然互为冲突对
+        const idx = conflictIndex.get(keyOf(hits[i], hits[j]));
+        if (idx !== undefined) cov.add(idx);
+      }
+    }
+    covers.push([...cov].sort((x, y) => x - y));
+  }
+
+  const picked = selectMinCover(covers, segCounts, candidates, conflicts.length);
+  const paths: ReproPath[] = picked.map((i) => ({
+    path: candidates[i],
+    hits: hitsPerPath[i],
+    covers: covers[i].map((ci) => ({ a: conflicts[ci].a, b: conflicts[ci].b })),
+  }));
+
+  return {
+    rules: selected,
+    conflicts,
+    candidatePaths: candidates.length,
+    totalConflicts: conflicts.length,
+    paths,
   };
 }

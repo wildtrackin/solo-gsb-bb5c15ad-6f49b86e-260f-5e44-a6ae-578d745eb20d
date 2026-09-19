@@ -1,4 +1,4 @@
-import type { AnalysisResult, ImpactResult, MatchResult, RuleInput } from './types';
+import type { AnalysisResult, ImpactResult, MatchResult, ReproResult, RuleInput } from './types';
 
 async function post<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -27,4 +27,8 @@ export function computeImpact(
   samples: string[],
 ): Promise<ImpactResult> {
   return post<ImpactResult>('/api/impact', { baseline, candidate, samples });
+}
+
+export function computeRepro(rules: RuleInput[], ruleIds: string[]): Promise<ReproResult> {
+  return post<ReproResult>('/api/repro', { rules, ruleIds });
 }
